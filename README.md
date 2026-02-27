@@ -1,4 +1,4 @@
-# POC Demo Org — Mist Org Cloner
+# Mist Org Cloner
 
 A command-line tool that clones a Juniper Mist organization — including sites, org-level templates, site settings, sitegroup memberships, alarm templates, and more — from one Mist environment to another. Designed for pre-sales and demo use, it walks you through the entire process interactively with no coding required.
 
@@ -6,7 +6,7 @@ A command-line tool that clones a Juniper Mist organization — including sites,
 
 ## Table of Contents
 
-- [POC Demo Org — Mist Org Cloner](#poc-demo-org--mist-org-cloner)
+- [Mist Org Cloner](#mist-org-cloner)
   - [Table of Contents](#table-of-contents)
   - [Access Assurance (NAC) Cloning](#access-assurance-nac-cloning)
     - [What is cloned automatically](#what-is-cloned-automatically)
@@ -172,11 +172,11 @@ Unzip the project to a folder you can easily find (e.g., your Desktop), producin
 
 **Option B — Git:**
 ```
-git clone https://github.com/with-tyler/POC_DEMO_ORG.git
-cd POC_DEMO_ORG
+git clone https://github.com/with-tyler/Mist-ORG-Clone-Tool.git
+cd Mist-ORG-Clone-Tool
 ```
 
-After this step the folder should contain: `poc_clone_org.py`, `requirements.txt`, `config.ini`, `example_config.ini`, and others.
+After this step the folder should contain: `main.py`, `requirements.txt`, `config.ini`, `example_config.ini`, and others.
 
 ---
 
@@ -186,14 +186,14 @@ A virtual environment keeps this project's dependencies isolated from the rest o
 
 **macOS / Linux:**
 ```
-cd ~/Desktop/POC_DEMO_ORG
+cd ~/Desktop/Mist-ORG-Clone-Tool
 python3 -m venv .venv
 source .venv/bin/activate
 ```
 
 **Windows:**
 ```
-cd C:\Users\YourName\Desktop\POC_DEMO_ORG
+cd C:\Users\YourName\Desktop\Mist-ORG-Clone-Tool
 python -m venv .venv
 .venv\Scripts\activate
 ```
@@ -206,7 +206,7 @@ Your terminal prompt will change to show `(.venv)` when the environment is activ
 
 ## Step 4 — Install Required Packages
 
-With your terminal open in the `POC_DEMO_ORG` folder (and the virtual environment active if you set one up), run:
+With your terminal open in the `Mist-ORG-Clone-Tool` folder (and the virtual environment active if you set one up), run:
 
 **macOS / Linux:**
 ```
@@ -257,22 +257,22 @@ Replace `YOUR_API_TOKEN_HERE` with your actual token. **Do not add quotes or ext
 
 > **Security:** Keep your API token private. Do not share `config.ini` or commit it to a public repository. The file `example_config.ini` is provided as a blank reference.
 
-> **Tip:** You can also create or manage profiles interactively by running `python3 poc_clone_org.py --init`, or by selecting "Add or manage API key profiles?" at the first prompt when the tool starts.
+> **Tip:** You can also create or manage profiles interactively by running `python3 main.py --init`, or by selecting "Add or manage API key profiles?" at the first prompt when the tool starts.
 
 ---
 
 ## Step 6 — Run the Tool
 
-With your terminal in the `POC_DEMO_ORG` folder:
+With your terminal in the `Mist-ORG-Clone-Tool` folder:
 
 **macOS / Linux:**
 ```
-python3 poc_clone_org.py
+python3 main.py
 ```
 
 **Windows:**
 ```
-python poc_clone_org.py
+python main.py
 ```
 
 The tool starts in **guided mode** and walks you through each step. At any prompt, press **Enter** to accept the default shown in brackets.
@@ -476,18 +476,18 @@ You need a valid API token in `config.ini` for **both** the source and destinati
 
 ```
 # Dry run only — no changes applied, report saved automatically
-python3 poc_clone_org.py --dry-run --preflight-json
+python3 main.py --dry-run --preflight-json
 
 # Save the preflight report to a custom file
-python3 poc_clone_org.py --preflight-json my_report.json
+python3 main.py --preflight-json my_report.json
 
 # Add or update an API key profile
-python3 poc_clone_org.py --init
+python3 main.py --init
 
 # Create config.ini from environment variables (useful in CI/CD)
 export MIST_API_TOKEN=your_token_here
 export MIST_BASE_URL=https://api.mist.com/api/v1
-python3 poc_clone_org.py --init-from-env
+python3 main.py --init-from-env
 ```
 
 ---
@@ -512,7 +512,7 @@ Your API token is incorrect, expired, or does not have Org Admin privileges. Ver
 
 ### The tool exits immediately or shows an error before any prompts
 
-Make sure your terminal is in the `POC_DEMO_ORG` folder before running. Use `cd` to navigate there first. Confirm `poc_clone_org.py` is present with `ls` (macOS/Linux) or `dir` (Windows).
+Make sure your terminal is in the `Mist-ORG-Clone-Tool` folder before running. Use `cd` to navigate there first. Confirm `main.py` is present with `ls` (macOS/Linux) or `dir` (Windows).
 
 ### A template is skipped with "not found in target org"
 
@@ -524,4 +524,4 @@ Each resource type is copied independently. If one template fails it is skipped 
 
 ---
 
-*For questions or issues, open a GitHub issue at [github.com/with-tyler/POC_DEMO_ORG](https://github.com/with-tyler/POC_DEMO_ORG).*
+*For questions or issues, open a GitHub issue at [github.com/with-tyler/Mist-ORG-Clone-Tool](https://github.com/with-tyler/Mist-ORG-Clone-Tool).*
