@@ -3,6 +3,8 @@ import configparser
 import json
 import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import requests
 from requests.adapters import HTTPAdapter
@@ -246,7 +248,7 @@ def try_list_orgs(session, base_url):
                     last_error = f"{url} returned no org privileges to list."
                     continue
 
-                return response.json(), None
+                return _paginate(session, url), None
 
             last_error = (
                 f"{url} returned status {response.status_code}: {response.text[:300]}"
@@ -290,7 +292,7 @@ def try_list_sites(session, base_url, org_id):
                     last_error = f"{url} returned no site privileges to list for org {org_id}."
                     continue
 
-                return response.json(), None
+                return _paginate(session, url), None
 
             last_error = (
                 f"{url} returned status {response.status_code}: {response.text[:300]}"
@@ -310,15 +312,16 @@ def get_site_details(session, site_id, base_url=None):
 def fetch_templates(session, org_id, base_url=None):
     _base = base_url or config_vars['base_url']
     endpoints = {
-        "switch": f"{_base}/orgs/{org_id}/networktemplates",
+        "switch":   f"{_base}/orgs/{org_id}/networktemplates",
         "wan_edge": f"{_base}/orgs/{org_id}/gatewaytemplates",
-        "wlan": f"{_base}/orgs/{org_id}/templates",
-        "rf": f"{_base}/orgs/{org_id}/rftemplates"
+        "wlan":     f"{_base}/orgs/{org_id}/templates",
+        "rf":       f"{_base}/orgs/{org_id}/rftemplates",
     }
     templates = {}
-    for key, url in endpoints.items():
-        response = api_request(session, "GET", url)
-        templates[key] = response.json()
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = {ex.submit(_paginate, session, url): key for key, url in endpoints.items()}
+        for future in as_completed(futures):
+            templates[futures[future]] = future.result()
     return templates
 
 
@@ -351,7 +354,6 @@ def build_wlan_scope_info(session, org_id, base_url=None):
                                                                  (applies.org_id is set)
     """
     url = f'{base_url or config_vars["base_url"]}/orgs/{org_id}/templates'
-    response = api_request(session, "GET", url)
     site_map: dict = {}
     org_level_ids: set = set()
 
@@ -361,7 +363,7 @@ def build_wlan_scope_info(session, org_id, base_url=None):
             if tid not in site_map[sid]:
                 site_map[sid].append(tid)
 
-    for template in response.json():
+    for template in _paginate(session, url):
         template_id = template.get("id")
         if not template_id:
             continue
@@ -393,8 +395,7 @@ def build_wlan_site_template_map(session, org_id, base_url=None):
 def fetch_sitegroups(session, org_id, base_url=None):
     """Returns list of sitegroup objects {id, name} for an org."""
     url = f'{base_url or config_vars["base_url"]}/orgs/{org_id}/sitegroups'
-    response = api_request(session, "GET", url)
-    return response.json()
+    return _paginate(session, url)
 
 
 def build_sitegroup_name_to_id(sitegroups):
@@ -756,7 +757,7 @@ def persist_section_updates(section_name, updates):
         config.write(file)
 
 
-def build_session(extra_headers=None):
+def build_session(extra_headers=None, pool_size=20):
     session = requests.Session()
     retries = Retry(
         total=5,
@@ -764,7 +765,11 @@ def build_session(extra_headers=None):
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET", "POST", "PUT", "DELETE"]
     )
-    adapter = HTTPAdapter(max_retries=retries)
+    adapter = HTTPAdapter(
+        max_retries=retries,
+        pool_connections=pool_size,
+        pool_maxsize=pool_size,
+    )
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     session.headers.update(extra_headers or headers)
@@ -781,6 +786,29 @@ def api_request(session, method, url, payload=None, ok_status=(200,)):
     if response.status_code in ok_status:
         return response
     raise Exception(f"{method} {url} failed: {response.text}")
+
+
+def _paginate(session, url):
+    """Fetch all pages from a Mist list endpoint and return the combined list.
+
+    Appends ``?page=N&limit=1000`` to *url* and keeps fetching until a page
+    returns fewer than 1 000 items, which signals the last page.
+    Falls back gracefully to the raw JSON if the response is not a list.
+    """
+    results = []
+    page = 1
+    limit = 1000
+    sep = "&" if "?" in url else "?"
+    while True:
+        paged = f"{url}{sep}page={page}&limit={limit}"
+        data = api_request(session, "GET", paged).json()
+        if not isinstance(data, list):
+            return data
+        results.extend(data)
+        if len(data) < limit:
+            break
+        page += 1
+    return results
 
 
 def validate_config_vars(vars_dict):
@@ -910,13 +938,13 @@ _SITE_SETTINGS_STRIP_FIELDS = {
 
 
 def copy_site_settings(session, source_site_id, target_site_id,
-                       source_base_url=None, dest_base_url=None, dest_session=None):
+                       source_base_url=None, dest_base_url=None, dest_session=None,
+                       _cached_settings=None):
     _src_base  = source_base_url or config_vars['base_url']
     _dst_base  = dest_base_url   or config_vars['base_url']
     _dst_sess  = dest_session    or session
-    site_settings = get_site_settings(session, source_site_id, base_url=_src_base)
-    # Strip read-only and template-assignment fields — template IDs from the source org
-    # are invalid in the new org and are applied separately via assign_templates.
+    site_settings = _cached_settings if _cached_settings is not None \
+        else get_site_settings(session, source_site_id, base_url=_src_base)
     cleaned = {k: v for k, v in site_settings.items() if k not in _SITE_SETTINGS_STRIP_FIELDS}
     url = f'{_dst_base}/sites/{target_site_id}/setting'
     api_request(_dst_sess, "PUT", url, payload=cleaned)
@@ -929,20 +957,20 @@ def fetch_site_wlans(session, site_id, base_url=None):
     """Return all site-specific WLANs for a site (may be empty list)."""
     url = f'{base_url or config_vars["base_url"]}/sites/{site_id}/wlans'
     try:
-        response = api_request(session, "GET", url)
-        return response.json()
+        return _paginate(session, url)
     except Exception as exc:
         ui.warn(f"Could not fetch site WLANs for site {site_id}: {exc}")
         return []
 
 
 def clone_site_wlans(source_session, dest_session, source_site_id, dest_site_id,
-                     source_base_url=None, dest_base_url=None):
+                     source_base_url=None, dest_base_url=None, _cached_wlans=None):
     """Copy site-specific WLANs from source site to destination site."""
     _src_base = source_base_url or config_vars['base_url']
     _dst_base = dest_base_url or config_vars['base_url']
     _dst_sess = dest_session or source_session
-    wlans = fetch_site_wlans(source_session, source_site_id, base_url=_src_base)
+    wlans = _cached_wlans if _cached_wlans is not None \
+        else fetch_site_wlans(source_session, source_site_id, base_url=_src_base)
     if not wlans:
         return 0
     create_url = f'{_dst_base}/sites/{dest_site_id}/wlans'
@@ -964,15 +992,14 @@ def fetch_site_maps(session, site_id, base_url=None):
     """Return all floor plan maps for a site (may be empty list)."""
     url = f'{base_url or config_vars["base_url"]}/sites/{site_id}/maps'
     try:
-        response = api_request(session, "GET", url)
-        return response.json()
+        return _paginate(session, url)
     except Exception as exc:
         ui.warn(f"Could not fetch site maps for site {site_id}: {exc}")
         return []
 
 
 def clone_site_maps(source_session, dest_session, source_site_id, dest_site_id,
-                    source_base_url=None, dest_base_url=None):
+                    source_base_url=None, dest_base_url=None, _cached_maps=None):
     """
     Copy floor plan maps from source site to destination site.
 
@@ -981,6 +1008,9 @@ def clone_site_maps(source_session, dest_session, source_site_id, dest_site_id,
       2. If the source map has an image URL, download it and re-upload it
          as multipart form data to the new map's image endpoint.
 
+    Image downloads and uploads are performed in parallel (one thread per map)
+    to minimise wall-clock time when a site has many floor plans.
+
     Returns the number of maps successfully created (image failures are
     warned but do not reduce the count).
     """
@@ -988,11 +1018,35 @@ def clone_site_maps(source_session, dest_session, source_site_id, dest_site_id,
     _dst_base = dest_base_url or config_vars['base_url']
     _dst_sess = dest_session or source_session
 
-    maps = fetch_site_maps(source_session, source_site_id, base_url=_src_base)
+    maps = _cached_maps if _cached_maps is not None \
+        else fetch_site_maps(source_session, source_site_id, base_url=_src_base)
     if not maps:
         return 0
 
     create_url = f'{_dst_base}/sites/{dest_site_id}/maps'
+
+    def _upload_image(map_name, new_map_id, source_image_url):
+        """Download the source image and upload it to the newly created map."""
+        try:
+            img_resp = requests.get(source_image_url, timeout=DEFAULT_TIMEOUT)
+            if img_resp.status_code != 200:
+                ui.warn(f"Could not download map image for '{map_name}': HTTP {img_resp.status_code}")
+                return
+            content_type = img_resp.headers.get("Content-Type", "application/octet-stream")
+            filename = source_image_url.split("/")[-1].split("?")[0] or "map_image"
+            upload_url = f'{_dst_base}/sites/{dest_site_id}/maps/{new_map_id}/image'
+            up_resp = _dst_sess.post(
+                upload_url,
+                files={'file': (filename, img_resp.content, content_type)},
+                headers={'Content-Type': None},
+                timeout=DEFAULT_TIMEOUT,
+            )
+            if up_resp.status_code not in (200, 201):
+                ui.warn(f"Map image upload failed for '{map_name}': {up_resp.text[:200]}")
+        except Exception as exc:
+            ui.warn(f"Map image upload skipped for '{map_name}': {exc}")
+
+    image_tasks = []
     ok = 0
     for site_map in maps:
         source_image_url = site_map.get("url")
@@ -1005,27 +1059,13 @@ def clone_site_maps(source_session, dest_session, source_site_id, dest_site_id,
             continue
 
         if source_image_url and new_map_id:
-            try:
-                img_resp = requests.get(source_image_url, timeout=DEFAULT_TIMEOUT)
-                if img_resp.status_code == 200:
-                    image_bytes = img_resp.content
-                    content_type = img_resp.headers.get("Content-Type", "application/octet-stream")
-                    filename = source_image_url.split("/")[-1].split("?")[0] or "map_image"
-                    upload_url = f'{_dst_base}/sites/{dest_site_id}/maps/{new_map_id}/image'
-                    up_resp = _dst_sess.post(
-                        upload_url,
-                        files={'file': (filename, image_bytes, content_type)},
-                        headers={'Content-Type': None},
-                        timeout=DEFAULT_TIMEOUT,
-                    )
-                    if up_resp.status_code not in (200, 201):
-                        ui.warn(f"Map image upload failed for '{site_map.get('name')}': {up_resp.text[:200]}")
-                else:
-                    ui.warn(f"Could not download map image for '{site_map.get('name')}': HTTP {img_resp.status_code}")
-            except Exception as exc:
-                ui.warn(f"Map image upload skipped for '{site_map.get('name')}': {exc}")
-
+            image_tasks.append((site_map.get("name", new_map_id), new_map_id, source_image_url))
         ok += 1
+
+    if image_tasks:
+        with ThreadPoolExecutor(max_workers=min(len(image_tasks), 8)) as ex:
+            list(ex.map(lambda t: _upload_image(*t), image_tasks))
+
     return ok
 
 
@@ -1113,39 +1153,56 @@ def summarize_list(items, label, max_items=5):
 def build_preflight_report(session, source_org_id, source_site_id, template_name_map,
                            source_base_url=None):
     _src_base = source_base_url or config_vars['base_url']
-    site_settings = get_site_settings(session, source_site_id, base_url=_src_base)
+
+    # ── 1. Parallel org-level and site-settings reads ──────────────────────
+    _fetch_tasks = {
+        "settings":         lambda: get_site_settings(session, source_site_id, base_url=_src_base),
+        "switch_templates": lambda: _paginate(session, f'{_src_base}/orgs/{source_org_id}/networktemplates'),
+        "wan_edge_templates": lambda: _paginate(session, f'{_src_base}/orgs/{source_org_id}/gatewaytemplates'),
+        "wlan_templates":   lambda: _paginate(session, f'{_src_base}/orgs/{source_org_id}/templates'),
+        "rf_templates":     lambda: _paginate(session, f'{_src_base}/orgs/{source_org_id}/rftemplates'),
+        "service_policies": lambda: _paginate(session, f'{_src_base}/orgs/{source_org_id}/servicepolicies'),
+        "sitegroups":       lambda: fetch_sitegroups(session, source_org_id, base_url=_src_base),
+    }
+    _results: dict = {}
+    with ThreadPoolExecutor(max_workers=len(_fetch_tasks)) as _ex:
+        _futures = {_ex.submit(fn): key for key, fn in _fetch_tasks.items()}
+        for _future in as_completed(_futures):
+            _results[_futures[_future]] = _future.result()
+
+    site_settings = _results["settings"]
     settings_keys = sorted(site_settings.keys())
     vars_count = len(site_settings.get("vars", {})) if isinstance(site_settings.get("vars"), dict) else 0
 
-    template_endpoints = {
-        "switch_templates":   f'{_src_base}/orgs/{source_org_id}/networktemplates',
-        "wan_edge_templates": f'{_src_base}/orgs/{source_org_id}/gatewaytemplates',
-        "wlan_templates":     f'{_src_base}/orgs/{source_org_id}/templates',
-        "rf_templates":       f'{_src_base}/orgs/{source_org_id}/rftemplates'
+    templates = {
+        label: [{"id": i.get("id"), "name": i.get("name")} for i in _results[label]]
+        for label in ("switch_templates", "wan_edge_templates", "wlan_templates", "rf_templates")
     }
-
-    templates = {}
-    for label, url in template_endpoints.items():
-        response = api_request(session, "GET", url)
-        templates[label] = [
-            {"id": item.get("id"), "name": item.get("name")}
-            for item in response.json()
-        ]
-
-    response = api_request(session, "GET", f'{_src_base}/orgs/{source_org_id}/servicepolicies')
     service_policies = [
-        {"id": item.get("id"), "name": item.get("name")}
-        for item in response.json()
+        {"id": i.get("id"), "name": i.get("name")} for i in _results["service_policies"]
     ]
-
-    source_sitegroups_preflight = fetch_sitegroups(session, source_org_id, base_url=_src_base)
+    source_sitegroups_preflight = _results["sitegroups"]
     source_sg_id_to_name = {sg.get("id"): sg.get("name") for sg in source_sitegroups_preflight}
+
+    # ── 2. Parallel per-site detail fetches ────────────────────────────────
+    site_plans = config_vars.get("site_plans", [])
+    site_plan_ids = [sp.get("source_site_id") for sp in site_plans if sp.get("source_site_id")]
+    site_details_map: dict = {}
+    if site_plan_ids:
+        with ThreadPoolExecutor(max_workers=min(len(site_plan_ids), 10)) as _ex:
+            _fut_map = {
+                _ex.submit(get_site_details, session, sid, _src_base): sid
+                for sid in site_plan_ids
+            }
+            for _future in as_completed(_fut_map):
+                site_details_map[_fut_map[_future]] = _future.result()
+
     per_site_sitegroups = []
-    for site_plan in config_vars.get("site_plans", []):
+    for site_plan in site_plans:
         sp_site_id = site_plan.get("source_site_id")
         if not sp_site_id:
             continue
-        sp_details = get_site_details(session, sp_site_id, base_url=_src_base)
+        sp_details = site_details_map.get(sp_site_id) or {}
         sg_ids = sp_details.get("sitegroup_ids") or []
         sg_names = [source_sg_id_to_name.get(sg_id, sg_id) for sg_id in sg_ids]
         per_site_sitegroups.append({
@@ -1154,6 +1211,7 @@ def build_preflight_report(session, source_org_id, source_site_id, template_name
             "sitegroup_names": sg_names
         })
 
+    # ── 3. Mode-4 template warning scan (reuses cached site details) ───────
     mode4_expected_template_warnings = []
     if config_vars.get("template_assignment_mode") == "4":
         source_id_to_name, _, _ = build_template_maps(
@@ -1163,11 +1221,12 @@ def build_preflight_report(session, source_org_id, source_site_id, template_name
         wlan_site_map, wlan_org_level_ids = build_wlan_scope_info(
             session, source_org_id, base_url=_src_base
         )
-        for site_plan in config_vars.get("site_plans", []):
+        for site_plan in site_plans:
             source_plan_site_id = site_plan.get("source_site_id")
             if not source_plan_site_id:
                 continue
-            source_site_details = get_site_details(session, source_plan_site_id, base_url=_src_base)
+            source_site_details = site_details_map.get(source_plan_site_id) or \
+                get_site_details(session, source_plan_site_id, base_url=_src_base)
             source_template_ids = derive_source_site_template_ids(
                 source_site_details,
                 site_id=source_plan_site_id,
@@ -1254,6 +1313,165 @@ def preflight_summary(preflight_report):
     ui.bullet("Template assignment mode", mode_label)
 
 
+def build_preflight_markdown(report: dict) -> str:
+    """
+    Render a preflight report dict as a human-readable Markdown document.
+
+    Each section is clearly separated so the file is easy to read in any
+    Markdown viewer (GitHub, VS Code preview, Obsidian, etc.).
+    """
+    from datetime import datetime
+    lines = []
+
+    def h1(t):  lines.extend([f"# {t}", ""])
+    def h2(t):  lines.extend([f"## {t}", ""])
+    def h3(t):  lines.extend([f"### {t}", ""])
+    def row(*cols): lines.append("| " + " | ".join(str(c) for c in cols) + " |")
+    def sep(*cols): lines.append("|" + "|".join(["---"] * len(cols)) + "|")
+    def blank():    lines.append("")
+
+    h1("Mist Org Clone — Preflight Report")
+    lines.append(f"*Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
+    blank()
+    lines.append("---")
+    blank()
+
+    # ─── 1. Organisation overview ────────────────────────────────────────
+    h2("Organisation Overview")
+    row("Field", "Value")
+    sep("Field", "Value")
+    row("Source org ID",  report.get("source_org_id",  "n/a"))
+    row("Source site ID", report.get("source_site_id", "n/a"))
+    blank()
+
+    # ─── 2. Site settings ──────────────────────────────────────────────
+    h2("Site Settings")
+    settings_keys = report.get("site_settings_keys", [])
+    vars_count    = report.get("site_vars_count", 0)
+    row("Property", "Value")
+    sep("Property", "Value")
+    row("Setting keys found", len(settings_keys))
+    row("Site variables",      f"{vars_count} var(s)")
+    if settings_keys:
+        preview = ", ".join(settings_keys[:15])
+        if len(settings_keys) > 15:
+            preview += f" … (+{len(settings_keys) - 15} more)"
+        row("Keys (preview)", preview)
+    blank()
+
+    # ─── 3. Templates ─────────────────────────────────────────────────
+    h2("Templates")
+    label_map = {
+        "switch_templates":   "Switch Templates",
+        "wan_edge_templates": "WAN Edge Templates",
+        "wlan_templates":     "WLAN Templates",
+        "rf_templates":       "RF Templates",
+    }
+    for key, heading in label_map.items():
+        items = report.get("templates", {}).get(key, [])
+        h3(heading)
+        if items:
+            row("#", "Name", "ID")
+            sep("#", "Name", "ID")
+            for idx, item in enumerate(items, 1):
+                row(idx, item.get("name", "(unnamed)"), item.get("id", ""))
+        else:
+            lines.append("*None found.*")
+        blank()
+
+    overrides = report.get("template_selection_overrides", {})
+    if any(overrides.values()):
+        h3("Config.ini Template Overrides")
+        row("Template Type", "Override Name")
+        sep("Template Type", "Override Name")
+        label_overrides = {
+            "switch_template_id":  "Switch",
+            "wan_edge_template_id": "WAN Edge",
+            "wlan_template_id":    "WLAN",
+            "rftemplate_id":       "RF",
+        }
+        for k, lbl in label_overrides.items():
+            val = overrides.get(k)
+            if val:
+                row(lbl, val)
+        blank()
+
+    # ─── 4. Service policies ────────────────────────────────────────────
+    h2("Service Policies")
+    policies = report.get("service_policies", [])
+    if policies:
+        row("#", "Name", "ID")
+        sep("#", "Name", "ID")
+        for idx, p in enumerate(policies, 1):
+            row(idx, p.get("name", "(unnamed)"), p.get("id", ""))
+    else:
+        lines.append("*None found.*")
+    blank()
+
+    # ─── 5. Site groups ────────────────────────────────────────────────
+    h2("Site Groups")
+    sitegroups = report.get("sitegroups", [])
+    if sitegroups:
+        row("#", "Name", "ID")
+        sep("#", "Name", "ID")
+        for idx, sg in enumerate(sitegroups, 1):
+            row(idx, sg.get("name", "(unnamed)"), sg.get("id", ""))
+    else:
+        lines.append("*None found.*")
+    blank()
+
+    # ─── 6. Per-site site group memberships ──────────────────────────
+    per_site_sg = report.get("per_site_sitegroup_assignments", [])
+    if per_site_sg:
+        h2("Site Group Memberships (per source site)")
+        row("Source Site", "Site Groups")
+        sep("Source Site", "Site Groups")
+        for entry in per_site_sg:
+            sg_names = ", ".join(entry.get("sitegroup_names") or []) or "*(none)*"
+            row(entry.get("source_site_name", entry.get("source_site_id", "?")), sg_names)
+        blank()
+
+    # ─── 7. Template assignment mode ──────────────────────────────────
+    h2("Template Assignment Mode")
+    assignment_mode = config_vars.get("template_assignment_mode", "")
+    mode_label = {
+        "1": "Mode 1 — Clone all templates; select assignments per site",
+        "2": "Mode 2 — Clone all templates; one template per type for all sites",
+        "3": "Mode 3 — Clone a single template per type; apply to all sites",
+        "4": "Mode 4 — Match each site to its current source templates",
+    }.get(assignment_mode, f"Unknown ({assignment_mode or 'not set'})")
+    lines.append(f"> **{mode_label}**")
+    blank()
+
+    # ─── 8. Mode-4 template warnings ───────────────────────────────────
+    warnings = [
+        w for w in report.get("mode4_expected_template_warnings", [])
+        if w.get("skipped_templates")
+    ]
+    if warnings:
+        h2("⚠️ Mode 4 Template Warnings")
+        lines.append(
+            "> The following source template assignments could not be automatically "
+            "resolved to a matching template in the new org.  "
+            "Review these before proceeding."
+        )
+        blank()
+        for w in warnings:
+            h3(f"Site: {w.get('source_site_name', w.get('source_site_id', '?'))}")
+            summary = w.get("warning_summary", "")
+            if summary:
+                lines.append(summary)
+            skipped = w.get("skipped_templates", {})
+            if skipped:
+                row("Template Type", "Reason")
+                sep("Template Type", "Reason")
+                for ttype, reason in skipped.items():
+                    row(ttype.replace("_", " "), reason)
+            blank()
+
+    return "\n".join(lines) + "\n"
+
+
 _SERVICEPOLICY_STRIP_FIELDS = {"id", "org_id", "created_time", "modified_time"}
 
 
@@ -1284,9 +1502,7 @@ def remap_gateway_template_service_policies(session, source_org_id, new_org_id,
     _dst_base = dest_base_url   or config_vars['base_url']
     _dst_sess = dest_session    or session
 
-    source_policies = api_request(
-        session, "GET", f'{_src_base}/orgs/{source_org_id}/servicepolicies'
-    ).json()
+    source_policies = _paginate(session, f'{_src_base}/orgs/{source_org_id}/servicepolicies')
 
     # Build lookup: source_id → name
     source_id_to_name = {}
@@ -1300,9 +1516,7 @@ def remap_gateway_template_service_policies(session, source_org_id, new_org_id,
 
     # Build lookup: name → id  from the policies already in the new org
     # (Mist's server-side clone copies them with new IDs).
-    new_policies = api_request(
-        _dst_sess, "GET", f'{_dst_base}/orgs/{new_org_id}/servicepolicies'
-    ).json()
+    new_policies = _paginate(_dst_sess, f'{_dst_base}/orgs/{new_org_id}/servicepolicies')
     new_name_to_id = {}
     new_id_to_action = {}
     for policy in new_policies:
@@ -1357,14 +1571,10 @@ def remap_gateway_template_service_policies(session, source_org_id, new_org_id,
     #
     # Strategy: use the source template as the authoritative list, rebuild from scratch.
 
-    source_gateway_templates = api_request(
-        session, "GET", f'{_src_base}/orgs/{source_org_id}/gatewaytemplates'
-    ).json()
+    source_gateway_templates = _paginate(session, f'{_src_base}/orgs/{source_org_id}/gatewaytemplates')
     source_gw_by_name = {t.get("name"): t for t in source_gateway_templates if t.get("name")}
 
-    gateway_templates = api_request(
-        _dst_sess, "GET", f'{_dst_base}/orgs/{new_org_id}/gatewaytemplates'
-    ).json()
+    gateway_templates = _paginate(_dst_sess, f'{_dst_base}/orgs/{new_org_id}/gatewaytemplates')
 
     def _policy_sort_key(e):
         if e.get("servicepolicy_id"):
@@ -1434,8 +1644,7 @@ _ORG_RESOURCE_STRIP_FIELDS = {"id", "org_id", "created_time", "modified_time"}
 def fetch_alarm_templates(session, org_id, base_url=None):
     """Return all alarm templates for an org."""
     url = f'{base_url or config_vars["base_url"]}/orgs/{org_id}/alarmtemplates'
-    response = api_request(session, "GET", url)
-    return response.json()
+    return _paginate(session, url)
 
 
 def clone_alarm_templates(source_session, dest_session, source_org_id, new_org_id,
@@ -1531,8 +1740,7 @@ def cross_cloud_bootstrap_org(source_session, dest_session, source_org_id,
 
     # 2. Service policies — copy first so gateway templates can reference them
     ui.progress("Copying service policies …")
-    sp_src_url = f"{source_base_url}/orgs/{source_org_id}/servicepolicies"
-    source_policies = api_request(source_session, "GET", sp_src_url).json()
+    source_policies = _paginate(source_session, f"{source_base_url}/orgs/{source_org_id}/servicepolicies")
     sp_id_map: dict = {}   # old_id → new_id
     sp_create_url = f"{dest_base_url}/orgs/{new_org_id}/servicepolicies"
     sp_ok = 0
@@ -1550,46 +1758,56 @@ def cross_cloud_bootstrap_org(source_session, dest_session, source_org_id,
             ui.warn(f"Service policy '{policy.get('name')}' skipped: {exc}")
     ui.ok(f"Service policies copied: {sp_ok}/{len(source_policies)}")
 
-    # 3-6. Template types (order matters: gatewaytemplates last so sp_id_map is full)
-    template_copy_tasks = [
-        ("Switch",    "networktemplates"),
-        ("RF",        "rftemplates"),
-        ("WLAN",      "templates"),
-        ("WAN Edge",  "gatewaytemplates"),
+    # 3-6. Copy Switch, RF, and WLAN templates in parallel; WAN Edge last (needs sp_id_map)
+    parallel_tasks = [
+        ("Switch",  "networktemplates"),
+        ("RF",      "rftemplates"),
+        ("WLAN",    "templates"),
     ]
-    for label, endpoint in template_copy_tasks:
-        ui.progress(f"Copying {label} templates …")
-        items = api_request(
-            source_session, "GET", f"{source_base_url}/orgs/{source_org_id}/{endpoint}"
-        ).json()
+
+    def _copy_template_type(label, endpoint):
+        items = _paginate(source_session, f"{source_base_url}/orgs/{source_org_id}/{endpoint}")
         create_url = f"{dest_base_url}/orgs/{new_org_id}/{endpoint}"
         t_ok = 0
         for item in items:
             payload = {k: v for k, v in item.items() if k not in _ORG_RESOURCE_STRIP_FIELDS}
-            # Remap service policy IDs inside gateway templates.
-            # Only entries with a servicepolicy_id are referenced policies and
-            # need remapping.  Inline entries (no servicepolicy_id) are copied verbatim.
-            if endpoint == "gatewaytemplates":
-                old_svc = payload.get("service_policies") or []
-                remapped = []
-                for entry in old_svc:
-                    src_sp_id = entry.get("servicepolicy_id")
-                    if src_sp_id:
-                        remapped.append({
-                            **entry,
-                            "servicepolicy_id": sp_id_map.get(src_sp_id, src_sp_id)
-                        })
-                    else:
-                        # Inline policy — copy as-is (no ID to remap)
-                        remapped.append(entry)
-                payload["service_policies"] = remapped
             try:
-                api_request(dest_session, "POST", create_url,
-                            payload=payload, ok_status=(200, 201))
+                api_request(dest_session, "POST", create_url, payload=payload, ok_status=(200, 201))
                 t_ok += 1
             except Exception as exc:
                 ui.warn(f"{label} template '{item.get('name')}' skipped: {exc}")
-        ui.ok(f"{label} templates copied: {t_ok}/{len(items)}")
+        return label, t_ok, len(items)
+
+    ui.progress("Copying Switch, RF and WLAN templates in parallel …")
+    with ThreadPoolExecutor(max_workers=3) as _ex:
+        _template_futures = {_ex.submit(_copy_template_type, lbl, ep): lbl
+                             for lbl, ep in parallel_tasks}
+        for _future in as_completed(_template_futures):
+            _lbl, _t_ok, _total = _future.result()
+            ui.ok(f"{_lbl} templates copied: {_t_ok}/{_total}")
+
+    # WAN Edge (gateway) templates — must run after service policies are all created.
+    ui.progress("Copying WAN Edge templates …")
+    gw_items = _paginate(source_session, f"{source_base_url}/orgs/{source_org_id}/gatewaytemplates")
+    gw_create_url = f"{dest_base_url}/orgs/{new_org_id}/gatewaytemplates"
+    gw_ok = 0
+    for item in gw_items:
+        payload = {k: v for k, v in item.items() if k not in _ORG_RESOURCE_STRIP_FIELDS}
+        old_svc = payload.get("service_policies") or []
+        remapped = []
+        for entry in old_svc:
+            src_sp_id = entry.get("servicepolicy_id")
+            if src_sp_id:
+                remapped.append({**entry, "servicepolicy_id": sp_id_map.get(src_sp_id, src_sp_id)})
+            else:
+                remapped.append(entry)
+        payload["service_policies"] = remapped
+        try:
+            api_request(dest_session, "POST", gw_create_url, payload=payload, ok_status=(200, 201))
+            gw_ok += 1
+        except Exception as exc:
+            ui.warn(f"WAN Edge template '{item.get('name')}' skipped: {exc}")
+    ui.ok(f"WAN Edge templates copied: {gw_ok}/{len(gw_items)}")
 
     # 8. Alarm templates
     clone_alarm_templates(
@@ -1622,7 +1840,7 @@ def clone_nac_sso_roles(source_session, dest_session, source_org_id, dest_org_id
     _src = source_base_url or config_vars['base_url']
     _dst = dest_base_url or config_vars['base_url']
     try:
-        items = api_request(source_session, "GET", f"{_src}/orgs/{source_org_id}/ssoroles").json()
+        items = _paginate(source_session, f"{_src}/orgs/{source_org_id}/ssoroles")
     except Exception as exc:
         ui.warn(f"Could not fetch SSO roles: {exc}")
         return {}
@@ -1653,7 +1871,7 @@ def clone_nac_ssos(source_session, dest_session, source_org_id, dest_org_id,
     _src = source_base_url or config_vars['base_url']
     _dst = dest_base_url or config_vars['base_url']
     try:
-        items = api_request(source_session, "GET", f"{_src}/orgs/{source_org_id}/ssos").json()
+        items = _paginate(source_session, f"{_src}/orgs/{source_org_id}/ssos")
     except Exception as exc:
         ui.warn(f"Could not fetch SSOs: {exc}")
         return {}
@@ -1765,9 +1983,9 @@ def clone_nac_tags(source_session, dest_session, source_org_id, dest_org_id,
     _src = source_base_url or config_vars['base_url']
     _dst = dest_base_url or config_vars['base_url']
     try:
-        items = api_request(
-            source_session, "GET", f"{_src}/orgs/{source_org_id}/nactags"
-        ).json()
+        items = _paginate(
+            source_session, f"{_src}/orgs/{source_org_id}/nactags"
+        )
     except Exception as exc:
         ui.warn(f"Could not fetch NAC tags: {exc}")
         return {}
@@ -1798,9 +2016,9 @@ def clone_nac_rules(source_session, dest_session, source_org_id, dest_org_id,
     _src = source_base_url or config_vars['base_url']
     _dst = dest_base_url or config_vars['base_url']
     try:
-        items = api_request(
-            source_session, "GET", f"{_src}/orgs/{source_org_id}/nacrules"
-        ).json()
+        items = _paginate(
+            source_session, f"{_src}/orgs/{source_org_id}/nacrules"
+        )
     except Exception as exc:
         ui.warn(f"Could not fetch NAC rules: {exc}")
         return
@@ -1827,9 +2045,9 @@ def clone_nac_portals(source_session, dest_session, source_org_id, dest_org_id,
     _src = source_base_url or config_vars['base_url']
     _dst = dest_base_url or config_vars['base_url']
     try:
-        items = api_request(
-            source_session, "GET", f"{_src}/orgs/{source_org_id}/nacportals"
-        ).json()
+        items = _paginate(
+            source_session, f"{_src}/orgs/{source_org_id}/nacportals"
+        )
     except Exception as exc:
         ui.warn(f"Could not fetch NAC portals: {exc}")
         return
@@ -1881,9 +2099,9 @@ def clone_psk_portals(source_session, dest_session, source_org_id, dest_org_id,
     _src = source_base_url or config_vars['base_url']
     _dst = dest_base_url or config_vars['base_url']
     try:
-        items = api_request(
-            source_session, "GET", f"{_src}/orgs/{source_org_id}/pskportals"
-        ).json()
+        items = _paginate(
+            source_session, f"{_src}/orgs/{source_org_id}/pskportals"
+        )
     except Exception as exc:
         ui.warn(f"Could not fetch PSK portals: {exc}")
         return
@@ -1945,9 +2163,9 @@ def clone_user_macs(source_session, dest_session, source_org_id, dest_org_id,
         ui.info("User MAC entries skipped.")
         return
     try:
-        items = api_request(
-            source_session, "GET", f"{_src}/orgs/{source_org_id}/usermacs"
-        ).json()
+        items = _paginate(
+            source_session, f"{_src}/orgs/{source_org_id}/usermacs"
+        )
     except Exception as exc:
         ui.warn(f"Could not fetch User MACs: {exc}")
         return
@@ -2049,6 +2267,30 @@ def clone_nac(source_session, dest_session, source_org_id, dest_org_id,
         source_session, dest_session, source_org_id, dest_org_id,
         source_base_url=source_base_url, dest_base_url=dest_base_url,
     )
+
+
+def _prefetch_source_site_data(source_session, site_id, source_base_url):
+    """
+    Concurrently fetch all source site data needed for cloning a single site.
+    Returns a dict with keys: 'settings', 'wlans', 'maps', 'details'.
+    On per-key failure the value is None (callers fall back to individual fetches).
+    """
+    results = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futs = {
+            pool.submit(get_site_settings, source_session, site_id, source_base_url): "settings",
+            pool.submit(fetch_site_wlans,  source_session, site_id, source_base_url): "wlans",
+            pool.submit(fetch_site_maps,   source_session, site_id, source_base_url): "maps",
+            pool.submit(get_site_details,  source_session, site_id, source_base_url): "details",
+        }
+        for fut in as_completed(futs):
+            key = futs[fut]
+            try:
+                results[key] = fut.result()
+            except Exception as exc:
+                results[key] = None
+                ui.warn(f"Pre-fetch '{key}' failed for source site {site_id}: {exc}")
+    return results
 
 
 # ── Main clone orchestration ────────────────────────────────────────────────────
@@ -2180,7 +2422,34 @@ def run_clone_flow(source_session, dest_session, source_base_url, dest_base_url,
                 else:
                     per_site_template_ids[key] = new_id
 
-    for site_plan in config_vars.get("site_plans", []):
+    site_plans = config_vars.get("site_plans", [])
+
+    # Pre-fetch all source site data (settings, WLANs, maps, details) in parallel
+    # before entering the site loop so each site avoids sequential round-trips.
+    pre_fetched: dict = {}
+    if site_plans:
+        ui.progress(f"Pre-fetching source data for {len(site_plans)} site(s) …")
+        with ThreadPoolExecutor(max_workers=min(len(site_plans), 10)) as pool:
+            futs = {
+                pool.submit(
+                    _prefetch_source_site_data,
+                    source_session,
+                    sp["source_site_id"],
+                    source_base_url,
+                ): sp["source_site_id"]
+                for sp in site_plans
+            }
+            for fut in as_completed(futs):
+                sid = futs[fut]
+                try:
+                    pre_fetched[sid] = fut.result()
+                except Exception as exc:
+                    pre_fetched[sid] = {}
+                    ui.warn(f"Pre-fetch failed for source site {sid}: {exc}")
+        ui.ok(f"Source site data pre-fetched for {len(pre_fetched)} site(s).")
+
+    for site_plan in site_plans:
+        cached = pre_fetched.get(site_plan["source_site_id"], {})
         skip_reasons = {}
         ui.section(f"Site  →  {site_plan['new_site_name']}")
         ui.progress(f"Creating site '{site_plan['new_site_name']}' …")
@@ -2199,6 +2468,7 @@ def run_clone_flow(source_session, dest_session, source_base_url, dest_base_url,
             source_session, site_plan["source_site_id"], new_site_id,
             source_base_url=source_base_url, dest_base_url=dest_base_url,
             dest_session=dest_session,
+            _cached_settings=cached.get("settings"),
         )
         ui.ok("Site settings copied.")
 
@@ -2207,6 +2477,7 @@ def run_clone_flow(source_session, dest_session, source_base_url, dest_base_url,
             source_session, dest_session,
             site_plan["source_site_id"], new_site_id,
             source_base_url=source_base_url, dest_base_url=dest_base_url,
+            _cached_wlans=cached.get("wlans"),
         )
         if wlan_count:
             ui.ok(f"Site-specific WLANs copied: {wlan_count}")
@@ -2218,14 +2489,16 @@ def run_clone_flow(source_session, dest_session, source_base_url, dest_base_url,
             source_session, dest_session,
             site_plan["source_site_id"], new_site_id,
             source_base_url=source_base_url, dest_base_url=dest_base_url,
+            _cached_maps=cached.get("maps"),
         )
         if maps_count:
             ui.ok(f"Site maps copied: {maps_count}")
         else:
             ui.info("No site maps found.")
 
-        source_site_details_for_sg = get_site_details(
-            source_session, site_plan["source_site_id"], base_url=source_base_url
+        source_site_details_for_sg = (
+            cached.get("details")
+            or get_site_details(source_session, site_plan["source_site_id"], base_url=source_base_url)
         )
         unmatched_sitegroups = clone_sitegroup_membership(
             dest_session,
@@ -2440,14 +2713,23 @@ def guided_flow(args):
         ui.bullet("Clone mode", "Same cloud instance")
 
     ui.section("Step 3 — Preflight Options")
-    report_path = args.preflight_json
+    report_path = args.preflight_json or args.preflight
     if report_path is None:
-        write_report = prompt_yes_no("Write preflight report to JSON?", default=True)
+        write_report = prompt_yes_no("Save preflight report to file?", default=True)
         if write_report:
-            report_path = prompt_input("Report filename", default="preflight_report.json")
+            fmt = prompt_input("Format? Enter 'md' for Markdown or 'json' for JSON", default="md")
+            if fmt.strip().lower() == "json":
+                report_path = prompt_input("Report filename", default="preflight_report.json")
+            else:
+                report_path = prompt_input("Report filename", default="preflight_report.md")
     if report_path:
-        with open(report_path, "w", encoding="utf-8") as file:
-            json.dump(preflight_report, file, indent=2, sort_keys=True)
+        if report_path.endswith(".md") or args.preflight:
+            md_content = build_preflight_markdown(preflight_report)
+            with open(report_path, "w", encoding="utf-8") as f:
+                f.write(md_content)
+        else:
+            with open(report_path, "w", encoding="utf-8") as file:
+                json.dump(preflight_report, file, indent=2, sort_keys=True)
         ui.ok(f"Preflight report written to {report_path}")
 
     if args.dry_run:
@@ -2471,7 +2753,8 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Only perform preflight checks and exit.")
     parser.add_argument("--init", action="store_true", help="Run the config init wizard and exit.")
     parser.add_argument("--init-from-env", action="store_true", help="Create config.ini from environment variables and exit.")
-    parser.add_argument("--preflight-json", nargs="?", const="preflight_report.json", help="Write preflight report to JSON file.")
+    parser.add_argument("--preflight-json", nargs="?", const="preflight_report.json", help="Write preflight report to a JSON file.")
+    parser.add_argument("--preflight", nargs="?", const="preflight_report.md", help="Write preflight report to a Markdown file (default: preflight_report.md).")
     parser.add_argument("--guided", action="store_true", help="Run the guided setup flow.")
     args = parser.parse_args()
 
@@ -2521,10 +2804,16 @@ def main():
             source_base_url=source_base_url,
         )
         preflight_summary(preflight_report)
-        if args.preflight_json:
-            with open(args.preflight_json, "w", encoding="utf-8") as file:
-                json.dump(preflight_report, file, indent=2, sort_keys=True)
-            ui.ok(f"Preflight report written to {args.preflight_json}")
+        if args.preflight_json or args.preflight:
+            out_path = args.preflight_json or args.preflight
+            if out_path.endswith(".md") or args.preflight:
+                md_content = build_preflight_markdown(preflight_report)
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write(md_content)
+            else:
+                with open(out_path, "w", encoding="utf-8") as file:
+                    json.dump(preflight_report, file, indent=2, sort_keys=True)
+            ui.ok(f"Preflight report written to {out_path}")
         if args.dry_run:
             ui.info("Dry-run mode — no changes applied.")
             _offer_save_log()
