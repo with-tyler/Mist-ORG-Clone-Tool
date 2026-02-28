@@ -162,6 +162,8 @@ def run_clone_flow(source_session, dest_session, source_base_url, dest_base_url,
         skip_reasons = {}
         ui.section(f"Site  →  {site_plan['new_site_name']}")
         ui.progress(f"Creating site '{site_plan['new_site_name']}' …")
+        source_details = cached.get("details") or {}
+        source_timezone = site_plan.get("timezone") or source_details.get("timezone")
         new_site_id = create_site(
             dest_session,
             new_org_id,
@@ -169,6 +171,7 @@ def run_clone_flow(source_session, dest_session, source_base_url, dest_base_url,
             site_plan["new_site_address"],
             site_plan["country_code"],
             base_url=dest_base_url,
+            timezone=source_timezone,
         )
         ui.ok(f"Site created  →  ID: {new_site_id}")
 
