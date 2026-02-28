@@ -24,4 +24,7 @@ A clear and concise description of what you expected to happen.
 If applicable, add screenshots to help explain your problem.
 
 **Additional context**
-Add any other context about the problem here.
+Add any other context about the problem here. Include API endpoints for the Mist dashboard if known. If no endpoints, include Mist a sanitized url endpoint.
+
+**Saved Log and Preflight**
+Paste your saved log from the guide workflow for identifying causal relationship if necessary. DO NOT INCLUDE your preflight report if you have it.
