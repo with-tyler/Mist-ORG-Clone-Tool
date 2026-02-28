@@ -174,6 +174,7 @@ def collect_run_details(session, base_url, cfg: RunConfig):
         source_name = site.get("name") or source_site_id
         source_address = site.get("address") or ""
         source_country_code = site.get("country_code") or ""
+        source_timezone = site.get("timezone") or ""
         ui.section(f"Configure Site — {source_name}  ({source_site_id})")
         if batch_keep_details is not None:
             keep_details = batch_keep_details
@@ -197,7 +198,8 @@ def collect_run_details(session, base_url, cfg: RunConfig):
             "source_site_name": source_name,
             "new_site_name": new_site_name,
             "new_site_address": new_site_address,
-            "country_code": country_code
+            "country_code": country_code,
+            "timezone": source_timezone,
         })
 
     cfg.site_plans = site_plans

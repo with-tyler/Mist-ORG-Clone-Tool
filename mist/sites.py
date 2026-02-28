@@ -20,9 +20,11 @@ def get_site_details(session, site_id, base_url):
     return response.json()
 
 
-def create_site(session, org_id, site_name, site_address, country_code, base_url):
+def create_site(session, org_id, site_name, site_address, country_code, base_url, timezone=None):
     url = f'{base_url}/orgs/{org_id}/sites'
     payload = {'name': site_name, 'address': site_address, 'country_code': country_code}
+    if timezone:
+        payload['timezone'] = timezone
     response = api_request(session, "POST", url, payload=payload)
     return response.json()['id']
 

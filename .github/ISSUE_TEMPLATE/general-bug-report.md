@@ -1,7 +1,7 @@
 ---
 name: General Bug report
 about: Create a report to help us improve
-title: "[BUG] - Bug"
+title: "[BUG]-[TITLE]"
 labels: bug
 assignees: with-tyler
 
