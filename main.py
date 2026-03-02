@@ -1,6 +1,9 @@
 import argparse
 import json
+import os
 import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
 import ui
 from config import RunConfig, load_config, validate_config_vars, init_config_wizard, init_config_from_env
