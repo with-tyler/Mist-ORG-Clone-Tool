@@ -22,7 +22,7 @@ from mist.cross_cloud import cross_cloud_bootstrap_org, remap_gateway_template_s
 
 def run_clone_flow(source_session, dest_session, source_base_url, dest_base_url,
                    template_name_map, cfg: RunConfig, cross_cloud=False):
-    ui.section("Step 4 — Cloning Organization")
+    ui.section("Step 5 — Cloning Organization")
 
     if cross_cloud:
         ui.progress("Bootstrapping organization on destination cloud …")
@@ -330,8 +330,8 @@ def run_clone_flow(source_session, dest_session, source_base_url, dest_base_url,
 
 
 def _setup_dest_context(source_session, source_base_url):
-    ui.section("Step 1b — Destination Instance")
-    ui.menu("Clone Mode", [
+    ui.section("Step 1b — Destination Cloud")
+    ui.menu("Where should the destination org live?", [
         ("1", "Same cloud instance (default)"),
         ("2", "Different cloud instance (cross-cloud)"),
     ])

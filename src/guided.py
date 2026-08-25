@@ -119,7 +119,7 @@ def try_list_sites(session, base_url, org_id):
 
 
 def collect_run_details(session, base_url, cfg: RunConfig):
-    ui.section("Step 2 — Source Configuration")
+    ui.section("Step 3 — Source Configuration")
     orgs, org_error = try_list_orgs(session, base_url)
     if orgs is not None:
         cfg.source_organization_id = select_from_list(orgs, "orgs") or ""
@@ -229,6 +229,18 @@ def guided_flow(args):
 
     dest_session, dest_base_url, cross_cloud = _setup_dest_context(source_session, source_base_url)
 
+    ui.section("Step 2 — Choose Operation")
+    ui.menu("What would you like to do?", [
+        ("1", "Clone to a new organization (default)"),
+        ("2", "Sync missing resources to an existing organization"),
+    ])
+    operation_mode = prompt_input("Select option", default="1")
+
+    if operation_mode == "2":
+        _guided_sync(source_session, dest_session, source_base_url, dest_base_url)
+        _offer_save_log()
+        return
+
     collect_run_details(source_session, source_base_url, cfg)
 
     template_name_map = {
@@ -251,7 +263,7 @@ def guided_flow(args):
     else:
         ui.bullet("Clone mode", "Same cloud instance")
 
-    ui.section("Step 3 — Preflight Options")
+    ui.section("Step 4 — Preflight Options")
     report_path = args.preflight_json or args.preflight
     if report_path is None:
         write_report = prompt_yes_no("Save preflight report to file?", default=True)
@@ -286,3 +298,50 @@ def guided_flow(args):
     run_clone_flow(source_session, dest_session, source_base_url, dest_base_url,
                    template_name_map, cfg=cfg, cross_cloud=cross_cloud)
     _offer_save_log()
+
+
+def _guided_sync(source_session, dest_session, source_base_url, dest_base_url):
+    from mist.cross_cloud import preview_org_sync, sync_org_resources
+
+    ui.section("Sync — Source Organization")
+    ui.info("Select the org with the correct / complete configuration.")
+    orgs, org_error = try_list_orgs(source_session, source_base_url)
+    if orgs:
+        source_org_id = select_from_list(orgs, "orgs")
+    else:
+        ui.warn(f"Unable to list orgs: {org_error}")
+        source_org_id = None
+
+    if not source_org_id:
+        source_org_id = prompt_input("Source organization ID")
+
+    ui.section("Sync — Destination Organization")
+    ui.info("Select the org that needs missing resources added.")
+    dest_orgs, dest_error = try_list_orgs(dest_session, dest_base_url)
+    if dest_orgs:
+        dest_org_id = select_from_list(dest_orgs, "orgs")
+    else:
+        ui.warn(f"Unable to list destination orgs: {dest_error}")
+        dest_org_id = None
+
+    if not dest_org_id:
+        dest_org_id = prompt_input("Destination organization ID")
+
+    total_missing = preview_org_sync(
+        source_session, dest_session,
+        source_org_id, dest_org_id,
+        source_base_url, dest_base_url,
+    )
+
+    if not total_missing:
+        return
+
+    if not prompt_yes_no("Proceed with sync?", default=False):
+        ui.info("Sync aborted.")
+        return
+
+    sync_org_resources(
+        source_session, dest_session,
+        source_org_id, dest_org_id,
+        source_base_url, dest_base_url,
+    )
