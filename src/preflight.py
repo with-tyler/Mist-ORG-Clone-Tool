@@ -27,7 +27,10 @@ def build_preflight_report(session, source_org_id, source_site_id, template_name
         "wan_edge_templates": lambda: _paginate(session, f'{source_base_url}/orgs/{source_org_id}/gatewaytemplates'),
         "wlan_templates":     lambda: _paginate(session, f'{source_base_url}/orgs/{source_org_id}/templates'),
         "rf_templates":       lambda: _paginate(session, f'{source_base_url}/orgs/{source_org_id}/rftemplates'),
+        "services":           lambda: _paginate(session, f'{source_base_url}/orgs/{source_org_id}/services'),
         "service_policies":   lambda: _paginate(session, f'{source_base_url}/orgs/{source_org_id}/servicepolicies'),
+        "networks":           lambda: _paginate(session, f'{source_base_url}/orgs/{source_org_id}/networks'),
+        "org_wlans":          lambda: _paginate(session, f'{source_base_url}/orgs/{source_org_id}/wlans'),
         "sitegroups":         lambda: fetch_sitegroups(session, source_org_id, base_url=source_base_url),
     }
     _results: dict = {}
@@ -44,8 +47,17 @@ def build_preflight_report(session, source_org_id, source_site_id, template_name
         label: [{"id": i.get("id"), "name": i.get("name")} for i in _results[label]]
         for label in ("switch_templates", "wan_edge_templates", "wlan_templates", "rf_templates")
     }
+    services = [
+        {"id": i.get("id"), "name": i.get("name")} for i in _results["services"]
+    ]
     service_policies = [
         {"id": i.get("id"), "name": i.get("name")} for i in _results["service_policies"]
+    ]
+    networks = [
+        {"id": i.get("id"), "name": i.get("name")} for i in _results["networks"]
+    ]
+    org_wlans = [
+        {"id": i.get("id"), "name": i.get("ssid", i.get("name"))} for i in _results["org_wlans"]
     ]
     source_sitegroups_preflight = _results["sitegroups"]
     source_sg_id_to_name = {sg.get("id"): sg.get("name") for sg in source_sitegroups_preflight}
@@ -123,7 +135,10 @@ def build_preflight_report(session, source_org_id, source_site_id, template_name
         "site_settings_keys": settings_keys,
         "site_vars_count": vars_count,
         "templates": templates,
+        "services": services,
         "service_policies": service_policies,
+        "networks": networks,
+        "org_wlans": org_wlans,
         "template_selection_overrides": {
             "switch_template_id": template_name_map.get("switch_template_id"),
             "wan_edge_template_id": template_name_map.get("wan_edge_template_id"),
@@ -154,7 +169,10 @@ def preflight_summary(preflight_report, template_assignment_mode=""):
     for label, items in preflight_report.get("templates", {}).items():
         summarize_list(items, label.replace("_", " "))
 
+    summarize_list(preflight_report.get("services", []), "Services")
     summarize_list(preflight_report.get("service_policies", []), "Service policies")
+    summarize_list(preflight_report.get("networks", []), "Networks")
+    summarize_list(preflight_report.get("org_wlans", []), "Org-level WLANs (SSIDs)")
     summarize_list(preflight_report.get("sitegroups", []), "Site groups")
 
     per_site_sg = preflight_report.get("per_site_sitegroup_assignments", [])
